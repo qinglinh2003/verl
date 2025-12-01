@@ -262,6 +262,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages','loss_mask']
         else:
             select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        if 'byol_loss_mean' in data.batch.keys():
+            select_keys.append('byol_loss_mean')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
@@ -347,6 +349,13 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
                         metrics['actor/kl_coef'] = self.config.kl_loss_coef
+
+                    # Optional BYOL aux loss
+                    byol_aux_weight = getattr(self.config, "byol_aux_weight", 0.0)
+                    if byol_aux_weight > 0 and "byol_loss_mean" in data:
+                        aux = data["byol_loss_mean"]
+                        policy_loss = policy_loss + byol_aux_weight * aux
+                        metrics['actor/byol_aux_loss'] = aux.detach().item() * byol_aux_weight
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

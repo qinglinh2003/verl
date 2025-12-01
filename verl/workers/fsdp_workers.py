@@ -536,6 +536,92 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_hidden_states(self, data: DataProto):
+        """Compute last-layer hidden states for given tokenized inputs."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(torch.cuda.current_device())
+        select_keys = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_select_keys = []
+        if "multi_modal_inputs" in data.non_tensor_batch:
+            non_tensor_select_keys.append("multi_modal_inputs")
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        micro_bs = data.meta_info.get("micro_batch_size", None) or self.config.rollout.get(
+            "log_prob_micro_batch_size_per_gpu", None
+        )
+        micro_batches = data.split(micro_bs) if micro_bs else [data]
+
+        hidden_list = []
+        with torch.no_grad():
+            for micro in micro_batches:
+                micro = micro.to(torch.cuda.current_device())
+                inputs = {**micro.batch, **micro.non_tensor_batch}
+                outputs = self.actor(
+                    **inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+                last_hidden = outputs.hidden_states[-1]
+                if isinstance(last_hidden, tuple):
+                    last_hidden = last_hidden[0]
+                hidden_list.append(last_hidden.detach().cpu())
+
+        hidden_states = torch.cat(hidden_list, dim=0)
+        output = DataProto.from_dict(tensors={'hidden_states': hidden_states}).to('cpu')
+
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage('After compute_hidden_states', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_vision_features(self, data: DataProto):
+        """Compute pooled vision tower features from multi_modal_inputs."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(torch.cuda.current_device())
+        non_tensor_select_keys = []
+        if "multi_modal_inputs" in data.non_tensor_batch:
+            non_tensor_select_keys.append("multi_modal_inputs")
+        data = data.select(batch_keys=[], non_tensor_batch_keys=non_tensor_select_keys)
+
+        hidden_list = []
+        with torch.no_grad():
+            for micro in data.split(data.meta_info.get("micro_batch_size", None) or len(data)):
+                micro = micro.to(torch.cuda.current_device())
+                mm = micro.non_tensor_batch.get("multi_modal_inputs", {})
+                if not mm:
+                    continue
+                if "pixel_values" in mm:
+                    outputs = self.actor.actor_module.model.visual(pixel_values=mm["pixel_values"], output_hidden_states=True)
+                elif "images" in mm:
+                    outputs = self.actor.actor_module.model.visual(images=mm["images"], output_hidden_states=True)
+                else:
+                    raise ValueError("compute_vision_features expects pixel_values or images in multi_modal_inputs")
+                last_hidden = outputs.hidden_states[-1]
+                if isinstance(last_hidden, tuple):
+                    last_hidden = last_hidden[0]
+                pooled = last_hidden.mean(dim=1)
+                hidden_list.append(pooled.detach().cpu())
+
+        features = torch.cat(hidden_list, dim=0) if hidden_list else torch.empty(0)
+        output = DataProto.from_dict(tensors={'vision_features': features}).to('cpu')
+
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage('After compute_vision_features', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 
