@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import numpy as np
 import warnings
 
 import torch
@@ -552,14 +553,17 @@ class ActorRolloutRefWorker(Worker):
         micro_bs = data.meta_info.get("micro_batch_size", None) or self.config.rollout.get(
             "log_prob_micro_batch_size_per_gpu", None
         )
-        micro_batches = data.split(micro_bs) if micro_bs else [data]
+        if micro_bs and hasattr(data, 'split'):
+            micro_batches = data.split(micro_bs)
+        else:
+            micro_batches = [data]
 
         hidden_list = []
         with torch.no_grad():
             for micro in micro_batches:
                 micro = micro.to(torch.cuda.current_device())
                 inputs = {**micro.batch, **micro.non_tensor_batch}
-                outputs = self.actor(
+                outputs = self.actor.actor_module(
                     **inputs,
                     output_hidden_states=True,
                     use_cache=False,
@@ -582,34 +586,91 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_vision_features(self, data: DataProto):
         """Compute pooled vision tower features from multi_modal_inputs."""
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         data = data.to(torch.cuda.current_device())
-        non_tensor_select_keys = []
-        if "multi_modal_inputs" in data.non_tensor_batch:
-            non_tensor_select_keys.append("multi_modal_inputs")
-        data = data.select(batch_keys=[], non_tensor_batch_keys=non_tensor_select_keys)
 
         hidden_list = []
-        with torch.no_grad():
-            for micro in data.split(data.meta_info.get("micro_batch_size", None) or len(data)):
-                micro = micro.to(torch.cuda.current_device())
-                mm = micro.non_tensor_batch.get("multi_modal_inputs", {})
-                if not mm:
-                    continue
-                if "pixel_values" in mm:
-                    outputs = self.actor.actor_module.model.visual(pixel_values=mm["pixel_values"], output_hidden_states=True)
-                elif "images" in mm:
-                    outputs = self.actor.actor_module.model.visual(images=mm["images"], output_hidden_states=True)
+        
+        with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False, recurse=True):
+            with torch.no_grad():
+                micro_bs = data.meta_info.get("micro_batch_size", None)
+                if micro_bs and hasattr(data, 'split'):
+                    try:
+                        micro_batches = data.split(micro_bs)
+                    except:
+                        micro_batches = [data]
                 else:
-                    raise ValueError("compute_vision_features expects pixel_values or images in multi_modal_inputs")
-                last_hidden = outputs.hidden_states[-1]
-                if isinstance(last_hidden, tuple):
-                    last_hidden = last_hidden[0]
-                pooled = last_hidden.mean(dim=1)
-                hidden_list.append(pooled.detach().cpu())
+                    micro_batches = [data]
+                
+                for micro in micro_batches:
+                    micro = micro.to(torch.cuda.current_device())
+                    
+                    pixel_values = None
+                    pixel_values_raw = micro.non_tensor_batch.get("pixel_values", None)
+                    if pixel_values_raw is not None:
+                        if isinstance(pixel_values_raw, np.ndarray) and pixel_values_raw.dtype == object:
+                            pixel_values = pixel_values_raw[0]
+                        else:
+                            pixel_values = pixel_values_raw
+                    
+                    grid_thw = None
+                    grid_thw_raw = micro.non_tensor_batch.get("image_grid_thw", None)
+                    if grid_thw_raw is not None:
+                        if isinstance(grid_thw_raw, np.ndarray) and grid_thw_raw.dtype == object:
+                            grid_thw = grid_thw_raw[0]
+                        else:
+                            grid_thw = grid_thw_raw
+                    
+                    if pixel_values is None:
+                        mm_raw = micro.non_tensor_batch.get("multi_modal_inputs", None)
+                        if mm_raw:
+                            if isinstance(mm_raw, list):
+                                mm = mm_raw[0] if mm_raw else {}
+                            elif isinstance(mm_raw, np.ndarray) and mm_raw.dtype == object:
+                                mm = mm_raw[0] if len(mm_raw) > 0 else {}
+                            else:
+                                mm = mm_raw
+                            pixel_values = mm.get("pixel_values", None)
+                            if grid_thw is None:
+                                grid_thw = mm.get("image_grid_thw", None)
+                    
+                    if pixel_values is None:
+                        continue
+                    
+                    device = torch.cuda.current_device()
+                    
+                    try:
+                        visual_module = self.actor.actor_module.visual
+                        
+                        if not isinstance(pixel_values, torch.Tensor):
+                            pixel_values = torch.as_tensor(pixel_values)
+                        pixel_values = pixel_values.to(device=device, dtype=torch.bfloat16).contiguous()
+                        
+                        if grid_thw is not None:
+                            if not isinstance(grid_thw, torch.Tensor):
+                                grid_thw = torch.as_tensor(grid_thw)
+                            grid_thw = grid_thw.to(device=device).contiguous()
+                        
+                        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                            visual_out = visual_module(pixel_values, grid_thw=grid_thw)
+                        
+                        if visual_out.dim() == 2:
+                            pooled = visual_out.mean(dim=0, keepdim=True)
+                        else:
+                            pooled = visual_out.mean(dim=1)
+                            
+                        hidden_list.append(pooled.float().detach().cpu())
+                        
+                    except Exception as e:
+                        print(f"[BYOL] visual encoder failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
 
         features = torch.cat(hidden_list, dim=0) if hidden_list else torch.empty(0)
         output = DataProto.from_dict(tensors={'vision_features': features}).to('cpu')
@@ -620,6 +681,8 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage('After compute_vision_features', logger=logger)
         return output
+
+
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
