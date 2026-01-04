@@ -208,6 +208,33 @@ class ActorRolloutRefWorker(Worker):
                                                               config=actor_model_config,
                                                               attn_implementation='flash_attention_2',
                                                               trust_remote_code=trust_remote_code)
+                        
+            if self.rank == 0:
+                print(f"[DEBUG] self.config type: {type(self.config)}")
+                print(f"[DEBUG] self.config keys: {self.config.keys() if hasattr(self.config, 'keys') else 'N/A'}")
+                if hasattr(self.config, 'byol_reward'):
+                    print(f"[DEBUG] byol_reward: {self.config.byol_reward}")
+
+            byol_enabled = False
+            if hasattr(self.config, 'byol_reward') and hasattr(self.config.byol_reward, 'enabled'):
+                byol_enabled = self.config.byol_reward.enabled
+            elif isinstance(self.config, dict) and 'byol_reward' in self.config:
+                byol_enabled = self.config.get('byol_reward', {}).get('enabled', False)
+
+            if self.rank == 0:
+                print(f"[DEBUG] byol_enabled = {byol_enabled}")
+
+            if byol_enabled and hasattr(actor_module, 'visual'):
+                for param in actor_module.visual.parameters():
+                    param.requires_grad = True
+                if self.rank == 0:
+                    print(f"[BYOL] Visual encoder unfrozen")
+            if byol_enabled and hasattr(actor_module, 'visual'):
+                for param in actor_module.visual.parameters():
+                    param.requires_grad = True
+                if self.rank == 0:
+                    print(f"[BYOL] Visual encoder unfrozen")
+            
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
@@ -681,6 +708,36 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage('After compute_vision_features', logger=logger)
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def get_visual_encoder_state_dict(self, data: DataProto):
+        """Get visual encoder state dict for BYOL EMA update.
+        
+        Only rank 0 returns valid state_dict, other ranks return empty dict.
+        This minimizes data transfer while working with DP_COMPUTE_PROTO dispatch.
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        
+        state_dict = {}
+        
+        with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False, recurse=True):
+            with torch.no_grad():
+                if self.rank == 0:
+                    visual_module = self.actor.actor_module.visual
+                    for name, param in visual_module.named_parameters():
+                        state_dict[name] = param.detach().cpu().clone()
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        
+        output = DataProto(non_tensor_batch={
+            'visual_state_dict': np.array([state_dict], dtype=object)
+        })
+        return output.to('cpu')
 
 
 
