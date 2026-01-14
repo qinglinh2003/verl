@@ -30,6 +30,8 @@ from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
+# BYOL aux loss: extract prediction hidden states
+from vagen.world_model.byol_world_model import get_prediction_hidden_state
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 from verl.utils.seed import seed_everything
@@ -264,6 +266,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if 'byol_loss_mean' in data.batch.keys():
             select_keys.append('byol_loss_mean')
+        if 'byol_target_hidden' in data.batch.keys():
+            select_keys.append('byol_target_hidden')
+        if 'byol_mask' in data.batch.keys():
+            select_keys.append('byol_mask')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
@@ -350,12 +356,40 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
                         metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
-                    # Optional BYOL aux loss
+                    # Optional BYOL aux loss (local forward with gradients)
                     byol_aux_weight = getattr(self.config, "byol_aux_weight", 0.0)
-                    if byol_aux_weight > 0 and "byol_loss_mean" in data:
-                        aux = data["byol_loss_mean"]
-                        policy_loss = policy_loss + byol_aux_weight * aux
-                        metrics['actor/byol_aux_loss'] = aux.detach().item() * byol_aux_weight
+                    if byol_aux_weight > 0 and hasattr(self, "byol_manager") and "byol_target_hidden" in data:
+                        # Prepare inputs for forward with hidden states
+                        inputs = {
+                            "input_ids": data["input_ids"],
+                            "attention_mask": data["attention_mask"],
+                            "position_ids": data.get("position_ids", None),
+                            "output_hidden_states": True,
+                        }
+                        if "multi_modal_inputs" in data:
+                            # Assumes multi_modal_inputs is a dict of tensors
+                            inputs.update(data["multi_modal_inputs"])
+                        # Remove None entries
+                        inputs = {k: v for k, v in inputs.items() if v is not None}
+
+                        outputs = self.actor_module(**inputs)
+                        last_hidden = outputs.hidden_states[-1]
+                        online_hidden = get_prediction_hidden_state(
+                            last_hidden_state=last_hidden,
+                            input_ids=data["input_ids"],
+                            attention_mask=data["attention_mask"],
+                            prediction_end_ids=[self.tokenizer.convert_tokens_to_ids("</prediction>")],
+                        )
+                        target_hidden = data["byol_target_hidden"]
+                        mask = data.get("byol_mask", None)
+
+                        byol_loss = self.byol_manager.compute_loss_only(
+                            online_hidden=online_hidden,
+                            target_hidden=target_hidden,
+                            mask=mask,
+                        )
+                        policy_loss = policy_loss + byol_aux_weight * byol_loss
+                        metrics['actor/byol_aux_loss'] = byol_loss.detach().item() * byol_aux_weight
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
