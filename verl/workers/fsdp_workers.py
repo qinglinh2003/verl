@@ -46,6 +46,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 
+def _build_byol_mlp(input_dim: int, hidden_dim: int, output_dim: int) -> torch.nn.Module:
+    """Simple BYOL-style projector/predictor MLP."""
+    return torch.nn.Sequential(
+        torch.nn.Linear(input_dim, hidden_dim),
+        torch.nn.LayerNorm(hidden_dim),
+        torch.nn.ReLU(),
+        torch.nn.Linear(hidden_dim, output_dim),
+    )
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
@@ -209,31 +219,32 @@ class ActorRolloutRefWorker(Worker):
                                                               attn_implementation='flash_attention_2',
                                                               trust_remote_code=trust_remote_code)
                         
+            # Attach BYOL heads to actor so they are checkpointed and optimized with actor optimizer.
+            byol_align_cfg = {}
+            if role == 'actor' and hasattr(self.config, 'actor') and self.config.actor is not None:
+                byol_align_cfg = self.config.actor.get('byol_align', {})
+            byol_align_enabled = bool(byol_align_cfg.get('enabled', False))
             if self.rank == 0:
-                print(f"[DEBUG] self.config type: {type(self.config)}")
-                print(f"[DEBUG] self.config keys: {self.config.keys() if hasattr(self.config, 'keys') else 'N/A'}")
-                if hasattr(self.config, 'byol_reward'):
-                    print(f"[DEBUG] byol_reward: {self.config.byol_reward}")
-
-            byol_enabled = False
-            if hasattr(self.config, 'byol_reward') and hasattr(self.config.byol_reward, 'enabled'):
-                byol_enabled = self.config.byol_reward.enabled
-            elif isinstance(self.config, dict) and 'byol_reward' in self.config:
-                byol_enabled = self.config.get('byol_reward', {}).get('enabled', False)
-
-            if self.rank == 0:
-                print(f"[DEBUG] byol_enabled = {byol_enabled}")
-
-            if byol_enabled and hasattr(actor_module, 'visual'):
-                for param in actor_module.visual.parameters():
-                    param.requires_grad = True
+                print(f"[BYOL ALIGN CONFIG] enabled={byol_align_enabled}, "
+                      f"weight={float(byol_align_cfg.get('weight', 0.0))}")
+            if byol_align_enabled:
+                hidden_dim = int(getattr(actor_model_config, 'hidden_size', byol_align_cfg.get('vlm_hidden_dim', 2048)))
+                visual_dim = int(byol_align_cfg.get('visual_hidden_dim', 2048))
+                predictor_hidden_raw = byol_align_cfg.get('predictor_hidden_dim', None)
+                predictor_hidden_dim = int(predictor_hidden_raw) if predictor_hidden_raw is not None else max(visual_dim // 2, 1)
+                actor_module.byol_projector = _build_byol_mlp(
+                    input_dim=hidden_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=visual_dim,
+                )
+                actor_module.byol_predictor = _build_byol_mlp(
+                    input_dim=visual_dim,
+                    hidden_dim=predictor_hidden_dim,
+                    output_dim=visual_dim,
+                )
                 if self.rank == 0:
-                    print(f"[BYOL] Visual encoder unfrozen")
-            if byol_enabled and hasattr(actor_module, 'visual'):
-                for param in actor_module.visual.parameters():
-                    param.requires_grad = True
-                if self.rank == 0:
-                    print(f"[BYOL] Visual encoder unfrozen")
+                    print(f"[BYOL ALIGN] Enabled with hidden_dim={hidden_dim}, visual_dim={visual_dim}, "
+                          f"predictor_hidden_dim={predictor_hidden_dim}")
             
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:

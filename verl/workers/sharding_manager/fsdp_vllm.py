@@ -73,6 +73,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
+        # vLLM model definition does not include BYOL-only auxiliary heads.
+        # Filter these keys out before syncing weights into the rollout engine.
+        byol_key_fragments = ('byol_projector.', 'byol_predictor.')
+        byol_keys = [name for name in params.keys() if any(fragment in name for fragment in byol_key_fragments)]
+        for name in byol_keys:
+            params.pop(name, None)
+        if byol_keys:
+            logger.info(f"Filtered {len(byol_keys)} BYOL auxiliary params before vLLM sync.")
         # Copy, not share memory
         load_format = 'hf' if self.full_params else 'dtensor'
 
