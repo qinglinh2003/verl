@@ -275,6 +275,9 @@ class DataParallelPPOActor(BasePPOActor):
         # string ends with "</", using the precomputed set passed via meta_info.
         PREDICTION_TOKEN_ID = 68931
         closing_slash_ids: frozenset = data.meta_info.get('glance_closing_slash_ids', frozenset())
+        # Fixed max_turns ensures all GPUs produce tensors with identical shape
+        # so DataProto.concat across workers does not fail.
+        fixed_max_turns: int = data.meta_info.get('glance_max_turns', 0)
         self.actor_module.eval()
 
         micro_batch_size = data.meta_info['micro_batch_size']
@@ -369,8 +372,18 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     ]
                 pred_positions.append(raw)
-            max_pred = max((p.numel() for p in pred_positions), default=1)
-            max_pred = max(max_pred, 1)
+            # Use fixed_max_turns as the output dimension when provided so that
+            # all data-parallel workers produce identically-shaped tensors.
+            # If a sequence has more occurrences than fixed_max_turns (e.g. the
+            # model hallucinated extra </prediction> tags), keep only the last
+            # fixed_max_turns positions (most recent turns).
+            if fixed_max_turns > 0:
+                pred_positions = [p[-fixed_max_turns:] if p.numel() > fixed_max_turns else p
+                                  for p in pred_positions]
+                max_pred = fixed_max_turns
+            else:
+                local_max = max((p.numel() for p in pred_positions), default=1)
+                max_pred = max(local_max, 1)
 
             h_pad = torch.zeros(B, max_pred, hidden_size, dtype=torch.float32,
                                 device=last_hidden.device)
@@ -401,6 +414,12 @@ class DataParallelPPOActor(BasePPOActor):
             glance_h[offset:offset + b, :n] = h
             glance_mask[offset:offset + b, :n] = m
             offset += b
+
+        valid_counts = glance_mask.sum(dim=-1).tolist()
+        print(f'[GLANCE] compute_glance_hidden_states: '
+              f'batch={B_total} h_shape={tuple(glance_h.shape)} '
+              f'valid_turns_per_seq={[int(v) for v in valid_counts]} '
+              f'h_norm_sample={glance_h[0, 0].norm().item():.4f}')
 
         return DataProto.from_dict(tensors={
             'glance_h_pred': glance_h,
