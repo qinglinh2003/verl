@@ -536,6 +536,30 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_glance_hidden_states(self, data: DataProto):
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(torch.cuda.current_device())
+        data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            output = self.actor.compute_glance_hidden_states(data=data)
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to('cpu')
+
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 

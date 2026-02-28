@@ -252,6 +252,161 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def compute_glance_hidden_states(self, data: DataProto) -> DataProto:
+        """Teacher-forcing forward to extract hidden states at </prediction> positions.
+
+        Token id 68931 ('prediction' without a leading space) uniquely identifies
+        the closing </prediction> tag in Qwen2.5-VL tokenization and does not
+        appear in normal prose or in the opening <prediction> tag.
+
+        Args:
+            data: DataProto with input_ids, attention_mask, position_ids and
+                  optionally multi_modal_inputs.
+                  meta_info must contain 'micro_batch_size'.
+
+        Returns:
+            DataProto with:
+                glance_h_pred : float32 (B, max_turns, hidden_size)
+                glance_h_mask : float32 (B, max_turns), 1 for valid turns
+        """
+        # Token id 68931 is the 'prediction' subtoken (no leading space).
+        # In context, it can appear in both ><prediction> and </prediction>.
+        # We discriminate by checking whether the preceding token's decoded
+        # string ends with "</", using the precomputed set passed via meta_info.
+        PREDICTION_TOKEN_ID = 68931
+        closing_slash_ids: frozenset = data.meta_info.get('glance_closing_slash_ids', frozenset())
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info['micro_batch_size']
+        select_keys = ['input_ids', 'attention_mask', 'position_ids']
+        has_mmi = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+
+        if has_mmi:
+            num_micro_batches = data.batch.batch_size[0] // micro_batch_size
+            micro_batches = data.select(select_keys, ['multi_modal_inputs']).chunk(num_micro_batches)
+        else:
+            micro_batches = data.select(batch_keys=select_keys).batch.split(micro_batch_size)
+
+        all_h = []
+        all_mask = []
+
+        for micro_batch in micro_batches:
+            if isinstance(micro_batch, DataProto):
+                mb = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            else:
+                mb = micro_batch
+
+            input_ids = mb['input_ids']
+            attention_mask = mb['attention_mask']
+            position_ids = mb['position_ids']
+            multi_modal_inputs = {}
+            if 'multi_modal_inputs' in mb:
+                for key in mb['multi_modal_inputs'][0].keys():
+                    multi_modal_inputs[key] = torch.cat(
+                        [inp[key] for inp in mb['multi_modal_inputs']], dim=0)
+
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)  # (B,3,S) -> (3,B,S)
+
+            B, seqlen = input_ids.shape
+
+            with torch.no_grad():
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    if self.use_remove_padding:
+                        input_ids_rmpad, indices, *_ = unpad_input(
+                            input_ids.unsqueeze(-1), attention_mask)
+                        input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                        if position_ids.dim() == 3:
+                            position_ids_rmpad = index_first_axis(
+                                rearrange(position_ids, "c b s ... -> (b s) c ..."),
+                                indices).transpose(0, 1).unsqueeze(1)
+                        else:
+                            position_ids_rmpad = index_first_axis(
+                                rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                indices).transpose(0, 1)
+
+                        output = self.actor_module(
+                            input_ids=input_ids_rmpad,
+                            attention_mask=None,
+                            position_ids=position_ids_rmpad,
+                            **multi_modal_inputs,
+                            use_cache=False,
+                            output_hidden_states=True,
+                        )
+                        # (1, total_nnz, hidden_size) -> (total_nnz, hidden_size)
+                        hs_rmpad = output.hidden_states[-1].squeeze(0).float()
+                        last_hidden = pad_input(
+                            hidden_states=hs_rmpad,
+                            indices=indices,
+                            batch=B,
+                            seqlen=seqlen,
+                        )  # (B, seqlen, hidden_size)
+                    else:
+                        output = self.actor_module(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            **multi_modal_inputs,
+                            use_cache=False,
+                            output_hidden_states=True,
+                        )
+                        last_hidden = output.hidden_states[-1].float()  # (B, seqlen, hidden_size)
+
+            hidden_size = last_hidden.shape[-1]
+
+            pred_positions = []
+            for b in range(B):
+                raw = (input_ids[b] == PREDICTION_TOKEN_ID).nonzero(as_tuple=True)[0]
+                if closing_slash_ids:
+                    # Keep only positions where the preceding token ends with "</",
+                    # which uniquely identifies the closing </prediction> tag.
+                    raw = raw[
+                        (raw > 0) &
+                        torch.tensor(
+                            [input_ids[b, p - 1].item() in closing_slash_ids for p in raw],
+                            dtype=torch.bool, device=raw.device,
+                        )
+                    ]
+                pred_positions.append(raw)
+            max_pred = max((p.numel() for p in pred_positions), default=1)
+            max_pred = max(max_pred, 1)
+
+            h_pad = torch.zeros(B, max_pred, hidden_size, dtype=torch.float32,
+                                device=last_hidden.device)
+            m_pad = torch.zeros(B, max_pred, dtype=torch.float32,
+                                device=last_hidden.device)
+            for b in range(B):
+                pos = pred_positions[b]
+                n = pos.numel()
+                if n > 0:
+                    h_pad[b, :n] = last_hidden[b, pos]
+                    m_pad[b, :n] = 1.0
+
+            all_h.append(h_pad)
+            all_mask.append(m_pad)
+
+        global_max = max(h.shape[1] for h in all_h)
+        hidden_size = all_h[0].shape[-1]
+        B_total = sum(h.shape[0] for h in all_h)
+        device = all_h[0].device
+        glance_h = torch.zeros(B_total, global_max, hidden_size,
+                               dtype=torch.float32, device=device)
+        glance_mask = torch.zeros(B_total, global_max,
+                                  dtype=torch.float32, device=device)
+
+        offset = 0
+        for h, m in zip(all_h, all_mask):
+            b, n = h.shape[0], h.shape[1]
+            glance_h[offset:offset + b, :n] = h
+            glance_mask[offset:offset + b, :n] = m
+            offset += b
+
+        return DataProto.from_dict(tensors={
+            'glance_h_pred': glance_h,
+            'glance_h_mask': glance_mask,
+        })
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
