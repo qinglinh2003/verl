@@ -224,6 +224,18 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
 
+        # GLANCE: deep-copy visual encoder BEFORE FSDP wrapping (use_orig_params=False
+        # replaces parameters with flat buffers, making post-wrap copies unusable).
+        glance_visual_copy = None
+        glance_config = self.config.get('glance', None)
+        if (role == 'actor'
+                and glance_config is not None
+                and glance_config.get('enabled', False)
+                and hasattr(actor_module, 'visual')):
+            import copy
+            glance_visual_copy = copy.deepcopy(actor_module.visual)
+            log_gpu_memory_usage('After GLANCE visual encoder copy', logger=logger)
+
         # We wrap FSDP for rollout as well
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
         if mixed_precision_config is not None:
@@ -289,7 +301,7 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('After actor optimizer init', logger=logger)
 
-        return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
+        return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config, glance_visual_copy
 
     def _build_rollout(self):
         from torch.distributed.device_mesh import init_device_mesh
@@ -358,7 +370,8 @@ class ActorRolloutRefWorker(Worker):
             else:
                 optim_config = None
                 fsdp_config = OmegaConf.create()
-            self.actor_module_fsdp, self.actor_optimizer, self.actor_lr_scheduler, self.actor_model_config = self._build_model_optimizer(
+            (self.actor_module_fsdp, self.actor_optimizer, self.actor_lr_scheduler,
+             self.actor_model_config, glance_visual_copy) = self._build_model_optimizer(
                 model_path=self.config.model.path,
                 fsdp_config=fsdp_config,
                 optim_config=optim_config,
@@ -375,14 +388,19 @@ class ActorRolloutRefWorker(Worker):
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
+        else:
+            glance_visual_copy = None
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
+            glance_config = self.config.get('glance', None)
             self.actor = DataParallelPPOActor(config=self.config.actor,
                                               actor_module=self.actor_module_fsdp,
-                                              actor_optimizer=self.actor_optimizer)
+                                              actor_optimizer=self.actor_optimizer,
+                                              glance_config=glance_config,
+                                              glance_f_phi=glance_visual_copy)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()

@@ -44,8 +44,16 @@ class DataParallelPPOActor(BasePPOActor):
         config,
         actor_module: nn.Module,
         actor_optimizer: torch.optim.Optimizer = None,
+        glance_config=None,
+        glance_f_phi: nn.Module = None,
     ):
-        """When optimizer is None, it is Reference Policy"""
+        """When optimizer is None, it is Reference Policy.
+
+        Args:
+            glance_config: OmegaConf node with GLANCE hyper-parameters (or None).
+            glance_f_phi: Pre-FSDP deep-copy of the visual encoder for the
+                          momentum target network (or None when GLANCE is disabled).
+        """
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
@@ -57,6 +65,52 @@ class DataParallelPPOActor(BasePPOActor):
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
         seed=self.config.get('seed', 42)
         seed_everything(seed)
+
+        # ── GLANCE initialisation ──────────────────────────────────────
+        self.glance_enabled = (
+            glance_config is not None
+            and glance_config.get('enabled', False)
+            and glance_f_phi is not None
+        )
+        if self.glance_enabled:
+            from vagen.world_model.glance_module import GLANCEReward
+
+            self.glance_config = glance_config
+            device = torch.cuda.current_device()
+
+            # Momentum encoder f_phi: frozen, eval-only, lives outside FSDP.
+            # Kept on CPU during init so it does not compete with vLLM for
+            # GPU memory; moved to GPU on-demand when computing targets.
+            self.glance_f_phi = glance_f_phi  # stays on CPU
+            self.glance_f_phi.eval()
+            for p in self.glance_f_phi.parameters():
+                p.requires_grad = False
+
+            # GLANCEReward contains projector g_psi.
+            # Also kept on CPU during init; moved to GPU before first use.
+            self.glance_reward = GLANCEReward(
+                vlm_hidden_dim=int(glance_config.get('vlm_hidden_dim', 2048)),
+                visual_dim=int(glance_config.get('visual_dim', 2048)),
+                beta=float(glance_config.get('beta', 0.1)),
+                drain_eps=float(glance_config.get('drain_eps', 0.1)),
+                drain_K=int(glance_config.get('drain_K', 20)),
+            )  # stays on CPU
+            self.glance_device = device  # target device for later .to() calls
+
+            # Projector-only optimiser (visual encoder updated via aux loss
+            # through the main FSDP optimiser in a later commit).
+            self.glance_optimizer = torch.optim.AdamW(
+                self.glance_reward.projector_parameters(),
+                lr=float(glance_config.get('projector_lr', 1e-6)),
+            )
+
+            n_phi = sum(p.numel() for p in self.glance_f_phi.parameters())
+            n_psi = sum(p.numel() for p in self.glance_reward.projector.parameters())
+            print(f'[GLANCE] Initialised: '
+                  f'f_phi params={n_phi:,} (frozen, on CPU until needed)  '
+                  f'projector params={n_psi:,}  '
+                  f'beta={glance_config.beta}  '
+                  f'ema_decay={glance_config.ema_decay}')
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
