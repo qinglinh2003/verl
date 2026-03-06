@@ -578,6 +578,17 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_glance_targets(self, data: DataProto):
+        """Encode next-obs images through momentum encoder to produce y_{t+1}."""
+        assert self._is_actor
+        # No need to load the FSDP actor model; only glance_f_phi is used,
+        # and it is managed (CPU<->GPU) inside compute_glance_targets itself.
+        data = data.to(torch.cuda.current_device())
+        output = self.actor.compute_glance_targets(data=data)
+        output = output.to('cpu')
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 

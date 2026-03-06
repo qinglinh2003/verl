@@ -480,6 +480,77 @@ class DataParallelPPOActor(BasePPOActor):
             'glance_h_mask': glance_mask,
         })
 
+    def compute_glance_targets(self, data: DataProto) -> DataProto:
+        """Encode next-observation images through the momentum encoder f_phi.
+
+        For each sample and each valid turn, feeds next-obs pixel_values and
+        image_grid_thw into glance_f_phi, then mean-pools patch tokens to
+        produce a single (d_vis,) target vector per turn.
+
+        Args:
+            data: DataProto with:
+                - glance_h_mask: (B, max_turns), 1.0 for valid turns
+                - non_tensor_batch['glance_next_obs_inputs']: list of B lists,
+                  each inner list has max_turns entries (dict or None per turn).
+                  Each dict has 'pixel_values' and 'image_grid_thw' from the
+                  Qwen2VLImageProcessor.
+
+        Returns:
+            DataProto with:
+                glance_y_next: (B, max_turns, d_vis), detached target representations
+        """
+        assert self.glance_enabled, "GLANCE is not enabled"
+
+        device = torch.device(f'cuda:{torch.cuda.current_device()}')
+        glance_h_mask = data.batch['glance_h_mask']  # (B, max_turns)
+        next_obs_inputs = data.non_tensor_batch['glance_next_obs_inputs']  # list of B items
+        B, max_turns = glance_h_mask.shape
+        # Derive d_vis from the actual merger output dim, not from config,
+        # so it stays correct regardless of model variant.
+        d_vis = self.glance_f_phi.merger.mlp[-1].out_features
+
+        # Move momentum encoder to GPU
+        self.glance_f_phi.to(device)
+
+        y_next = torch.zeros(B, max_turns, d_vis, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                for b in range(B):
+                    sample_inputs = next_obs_inputs[b]
+                    if sample_inputs is None:
+                        continue
+                    for t in range(min(len(sample_inputs), max_turns)):
+                        if glance_h_mask[b, t] < 0.5:
+                            continue
+                        turn_input = sample_inputs[t]
+                        if turn_input is None:
+                            continue
+
+                        pixel_values = turn_input['pixel_values'].to(
+                            device=device, dtype=self.glance_f_phi.patch_embed.proj.weight.dtype)
+                        grid_thw = turn_input['image_grid_thw'].to(device=device)
+
+                        # visual encoder output: (total_merged_patches, d_vis)
+                        # The merger reduces patches by spatial_merge_unit, so
+                        # the output length != grid_thw product. Mean-pool all
+                        # output patches directly (each obs is typically 1 image).
+                        patch_embeds = self.glance_f_phi(pixel_values, grid_thw=grid_thw)
+                        y_next[b, t] = patch_embeds.float().mean(dim=0)
+
+        # Move momentum encoder back to CPU to free GPU memory
+        self.glance_f_phi.to('cpu')
+
+        valid_count = int(glance_h_mask.sum().item())
+        y_norms = y_next[glance_h_mask > 0.5].norm(dim=-1)
+        print(f'[GLANCE] compute_glance_targets: '
+              f'y_next={tuple(y_next.shape)} valid={valid_count} '
+              f'norm_mean={y_norms.mean().item():.4f} norm_std={y_norms.std().item():.4f}')
+
+        return DataProto.from_dict(tensors={
+            'glance_y_next': y_next.detach().cpu(),
+        })
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
