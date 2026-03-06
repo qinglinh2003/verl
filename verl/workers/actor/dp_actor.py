@@ -97,18 +97,30 @@ class DataParallelPPOActor(BasePPOActor):
             )  # stays on CPU
             self.glance_device = device  # target device for later .to() calls
 
-            # Projector-only optimiser (visual encoder updated via aux loss
-            # through the main FSDP optimiser in a later commit).
+            # Collect FSDP flat-params belonging to the vision encoder so
+            # that L_explore gradients can update v alongside projector g_psi.
+            # With use_orig_params=False, each FSDP sub-module has a single
+            # FlatParameter; we identify visual ones by their module path.
+            visual_fsdp_params = []
+            for name, mod in self.actor_module.named_modules():
+                if 'visual' in name and isinstance(mod, FSDP) and hasattr(mod, '_flat_param'):
+                    visual_fsdp_params.append(mod._flat_param)
+
+            glance_lr = float(glance_config.get('projector_lr', 1e-6))
             self.glance_optimizer = torch.optim.AdamW(
-                self.glance_reward.projector_parameters(),
-                lr=float(glance_config.get('projector_lr', 1e-6)),
+                [{'params': list(self.glance_reward.projector_parameters())},
+                 {'params': visual_fsdp_params, 'lr': glance_lr}],
+                lr=glance_lr,
             )
+            self._glance_visual_fsdp_params = visual_fsdp_params
 
             n_phi = sum(p.numel() for p in self.glance_f_phi.parameters())
             n_psi = sum(p.numel() for p in self.glance_reward.projector.parameters())
+            n_ve = sum(p.numel() for p in visual_fsdp_params)
             print(f'[GLANCE] Initialised: '
                   f'f_phi params={n_phi:,} (frozen, on CPU until needed)  '
                   f'projector params={n_psi:,}  '
+                  f'visual_encoder FSDP params={n_ve:,} ({len(visual_fsdp_params)} flat tensors)  '
                   f'beta={glance_config.beta}  '
                   f'ema_decay={glance_config.ema_decay}')
 
@@ -610,6 +622,187 @@ class DataParallelPPOActor(BasePPOActor):
             'glance_intrinsic_rewards': intrinsic_rewards,
             'glance_l_explore': l_explore_out,
         })
+
+    def update_glance_representation(self, data: DataProto) -> dict:
+        """Joint representation learning step (Algorithm 1, Step A).
+
+        Freezes the LLM backbone, performs a forward pass with gradients
+        through the vision encoder, computes L_explore through the projector
+        g_psi, and updates both projector and vision encoder parameters.
+
+        Args:
+            data: DataProto with input_ids, attention_mask, position_ids,
+                  multi_modal_inputs, glance_h_mask, glance_y_next.
+                  meta_info must contain 'micro_batch_size'.
+        Returns:
+            Dict of metrics.
+        """
+        assert self.glance_enabled, "GLANCE is not enabled"
+
+        PREDICTION_TOKEN_ID = 68931
+        closing_slash_ids: frozenset = data.meta_info.get('glance_closing_slash_ids', frozenset())
+        fixed_max_turns: int = data.meta_info.get('glance_max_turns', 0)
+        micro_batch_size = data.meta_info['micro_batch_size']
+
+        glance_h_mask = data.batch['glance_h_mask']   # (B_total, max_turns)
+        glance_y_next = data.batch['glance_y_next']   # (B_total, max_turns, d_vis)
+
+        # ── Step 1: Freeze all non-visual parameters ──
+        frozen_params = []
+        for name, param in self.actor_module.named_parameters():
+            if 'visual' not in name:
+                if param.requires_grad:
+                    param.requires_grad = False
+                    frozen_params.append(param)
+
+        self.actor_module.train()
+
+        # Move projector to GPU
+        device = torch.device(f'cuda:{torch.cuda.current_device()}')
+        self.glance_reward.to(device)
+
+        select_keys = ['input_ids', 'attention_mask', 'position_ids']
+        has_mmi = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+
+        if has_mmi:
+            num_micro_batches = data.batch.batch_size[0] // micro_batch_size
+            micro_batches = data.select(select_keys, ['multi_modal_inputs']).chunk(num_micro_batches)
+        else:
+            micro_batches = data.select(batch_keys=select_keys).batch.split(micro_batch_size)
+
+        # ── Step 2-4: Forward, compute L_explore, backward, step ──
+        self.glance_optimizer.zero_grad()
+
+        total_l_explore = torch.tensor(0.0, device=device)
+        total_valid = 0
+        sample_offset = 0
+
+        for micro_batch in micro_batches:
+            if isinstance(micro_batch, DataProto):
+                mb = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            else:
+                mb = micro_batch
+
+            input_ids = mb['input_ids']
+            attention_mask = mb['attention_mask']
+            position_ids = mb['position_ids']
+            multi_modal_inputs = {}
+            if 'multi_modal_inputs' in mb:
+                for key in mb['multi_modal_inputs'][0].keys():
+                    multi_modal_inputs[key] = torch.cat(
+                        [inp[key] for inp in mb['multi_modal_inputs']], dim=0)
+
+            if position_ids.dim() == 3:
+                position_ids = position_ids.transpose(0, 1)
+
+            B, seqlen = input_ids.shape
+
+            # Forward WITH gradients (vision encoder unfrozen, LLM frozen)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                if self.use_remove_padding:
+                    input_ids_rmpad, indices, *_ = unpad_input(
+                        input_ids.unsqueeze(-1), attention_mask)
+                    input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+
+                    if position_ids.dim() == 3:
+                        position_ids_rmpad = index_first_axis(
+                            rearrange(position_ids, "c b s ... -> (b s) c ..."),
+                            indices).transpose(0, 1).unsqueeze(1)
+                    else:
+                        position_ids_rmpad = index_first_axis(
+                            rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                            indices).transpose(0, 1)
+
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                        output_hidden_states=True,
+                    )
+                    hs_rmpad = output.hidden_states[-1].squeeze(0).float()
+                    last_hidden = pad_input(
+                        hidden_states=hs_rmpad,
+                        indices=indices,
+                        batch=B,
+                        seqlen=seqlen,
+                    )
+                else:
+                    output = self.actor_module(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                        output_hidden_states=True,
+                    )
+                    last_hidden = output.hidden_states[-1].float()
+
+            # Extract h at </prediction> positions (same logic as compute_glance_hidden_states)
+            pred_positions = []
+            for b in range(B):
+                raw = (input_ids[b] == PREDICTION_TOKEN_ID).nonzero(as_tuple=True)[0]
+                if closing_slash_ids:
+                    raw = raw[
+                        (raw > 0) &
+                        torch.tensor(
+                            [input_ids[b, p - 1].item() in closing_slash_ids for p in raw],
+                            dtype=torch.bool, device=raw.device,
+                        )
+                    ]
+                if fixed_max_turns > 0 and raw.numel() > fixed_max_turns:
+                    raw = raw[-fixed_max_turns:]
+                pred_positions.append(raw)
+
+            # Compute L_explore per valid turn and accumulate
+            for b in range(B):
+                global_b = sample_offset + b
+                pos = pred_positions[b]
+                for t in range(pos.numel()):
+                    if t >= glance_h_mask.shape[1]:
+                        break
+                    if glance_h_mask[global_b, t] < 0.5:
+                        continue
+                    h = last_hidden[b, pos[t]].unsqueeze(0)  # (1, d_vlm)
+                    y = glance_y_next[global_b, t].unsqueeze(0).to(device).detach()  # (1, d_vis)
+                    l_exp = self.glance_reward.compute_l_explore(h, y)  # (1,)
+                    total_l_explore = total_l_explore + l_exp.sum()
+                    total_valid += 1
+
+            sample_offset += B
+
+        # Average L_explore and backward
+        metrics = {}
+        if total_valid > 0:
+            mean_l_explore = total_l_explore / total_valid
+            mean_l_explore.backward()
+
+            # Clip gradients for projector
+            proj_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.glance_reward.projector.parameters(), max_norm=1.0)
+
+            self.glance_optimizer.step()
+
+            metrics['glance/repr_l_explore'] = mean_l_explore.detach().item()
+            metrics['glance/proj_grad_norm'] = proj_grad_norm.detach().item()
+            print(f'[GLANCE] update_glance_representation: '
+                  f'valid={total_valid} '
+                  f'l_explore={mean_l_explore.item():.4f} '
+                  f'proj_grad_norm={proj_grad_norm.item():.4f}')
+        else:
+            print('[GLANCE] update_glance_representation: no valid turns, skipped')
+
+        self.glance_optimizer.zero_grad()
+
+        # Move projector back to CPU
+        self.glance_reward.to('cpu')
+
+        # ── Step 5: Unfreeze LLM parameters ──
+        for param in frozen_params:
+            param.requires_grad = True
+
+        return metrics
 
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
