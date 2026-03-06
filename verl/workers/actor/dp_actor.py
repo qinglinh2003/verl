@@ -804,6 +804,80 @@ class DataParallelPPOActor(BasePPOActor):
 
         return metrics
 
+    def update_glance_momentum(self) -> dict:
+        """EMA update: phi <- alpha * phi + (1 - alpha) * v  (Algorithm 1, Line 20).
+
+        Uses FSDP.summon_full_params to access the online vision encoder's
+        unsharded parameters on each rank, then updates the momentum encoder
+        f_phi in-place.
+
+        Returns:
+            Dict of metrics (ve_param_norm, phi_param_norm).
+        """
+        assert self.glance_enabled, "GLANCE is not enabled"
+        alpha = float(self.glance_config.get('ema_decay', 0.99))
+
+        device = torch.device(f'cuda:{torch.cuda.current_device()}')
+        self.glance_f_phi.to(device)
+
+        # Find the online visual encoder inside the FSDP-wrapped model.
+        # actor_module is the FSDP root; the unwrapped module has a .visual attr.
+        unwrapped = self.actor_module
+        if hasattr(unwrapped, '_fsdp_wrapped_module'):
+            unwrapped = unwrapped._fsdp_wrapped_module
+        online_visual = unwrapped.visual
+
+        with FSDP.summon_full_params(self.actor_module, writeback=False):
+            phi_params = dict(self.glance_f_phi.named_parameters())
+            ve_norm_sq = 0.0
+            matched = 0
+            for name, v_param in online_visual.named_parameters():
+                if name in phi_params:
+                    phi_p = phi_params[name]
+                    v_data = v_param.data.to(device=device, dtype=phi_p.dtype)
+                    phi_p.data.mul_(alpha).add_(v_data, alpha=1.0 - alpha)
+                    ve_norm_sq += v_data.float().norm().item() ** 2
+                    matched += 1
+
+        phi_norm_sq = sum(p.data.float().norm().item() ** 2 for p in self.glance_f_phi.parameters())
+
+        self.glance_f_phi.to('cpu')
+
+        metrics = {
+            'glance/ve_param_norm': ve_norm_sq ** 0.5,
+            'glance/phi_param_norm': phi_norm_sq ** 0.5,
+        }
+        print(f'[GLANCE] update_glance_momentum: '
+              f'alpha={alpha} matched={matched} '
+              f've_norm={ve_norm_sq**0.5:.2f} phi_norm={phi_norm_sq**0.5:.2f}')
+        return metrics
+
+    def check_glance_rejuvenation(self, mean_l_explore: float) -> dict:
+        """Check for curiosity drain and rejuvenate projector if needed.
+
+        Args:
+            mean_l_explore: Mean L_explore from the current iteration
+                            (from update_glance_representation).
+        Returns:
+            Dict of metrics (rejuvenation_triggered, drain_count).
+        """
+        assert self.glance_enabled, "GLANCE is not enabled"
+        triggered = self.glance_reward.check_and_rejuvenate(mean_l_explore)
+
+        if triggered:
+            # Reset optimizer state for projector param group (group 0)
+            for param in self.glance_reward.projector.parameters():
+                if param in self.glance_optimizer.state:
+                    del self.glance_optimizer.state[param]
+            print(f'[GLANCE] Rejuvenation triggered! Projector re-initialised, '
+                  f'optimizer state reset. l_explore={mean_l_explore:.4f}')
+
+        metrics = {
+            'glance/rejuvenation_triggered': 1.0 if triggered else 0.0,
+            'glance/drain_count': float(self.glance_reward._drain_count),
+        }
+        return metrics
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()

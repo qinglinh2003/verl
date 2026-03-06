@@ -619,6 +619,27 @@ class ActorRolloutRefWorker(Worker):
 
         return DataProto(meta_info={'metrics': metrics})
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_glance_momentum(self):
+        """EMA update of momentum encoder f_phi from online vision encoder."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        metrics = self.actor.update_glance_momentum()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return DataProto(meta_info={'metrics': metrics})
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def check_glance_rejuvenation(self, mean_l_explore: float):
+        """Check for curiosity drain and rejuvenate projector if needed."""
+        assert self._is_actor
+        metrics = self.actor.check_glance_rejuvenation(mean_l_explore)
+        return DataProto(meta_info={'metrics': metrics})
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
