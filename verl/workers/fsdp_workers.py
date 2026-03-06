@@ -581,11 +581,19 @@ class ActorRolloutRefWorker(Worker):
     def compute_glance_targets(self, data: DataProto):
         """Encode next-obs images through momentum encoder to produce y_{t+1}."""
         assert self._is_actor
-        # No need to load the FSDP actor model; only glance_f_phi is used,
-        # and it is managed (CPU<->GPU) inside compute_glance_targets itself.
+        use_momentum = self.actor.glance_config.get('use_momentum', True)
+        # When use_momentum=False, the online visual encoder (FSDP) is used
+        # instead of f_phi, so we need the FSDP model on GPU.
+        if not use_momentum and self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
         data = data.to(torch.cuda.current_device())
         output = self.actor.compute_glance_targets(data=data)
         output = output.to('cpu')
+
+        if not use_momentum and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

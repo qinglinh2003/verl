@@ -517,12 +517,21 @@ class DataParallelPPOActor(BasePPOActor):
         glance_h_mask = data.batch['glance_h_mask']  # (B, max_turns)
         next_obs_inputs = data.non_tensor_batch['glance_next_obs_inputs']  # list of B items
         B, max_turns = glance_h_mask.shape
-        # Derive d_vis from the actual merger output dim, not from config,
-        # so it stays correct regardless of model variant.
-        d_vis = self.glance_f_phi.merger.mlp[-1].out_features
 
-        # Move momentum encoder to GPU
-        self.glance_f_phi.to(device)
+        use_momentum = self.glance_config.get('use_momentum', True)
+        if use_momentum:
+            encoder = self.glance_f_phi
+            self.glance_f_phi.to(device)
+        else:
+            # Ablation: use online visual encoder directly (no EMA lag).
+            # FSDP model must already be loaded to GPU by the worker.
+            unwrapped = self.actor_module
+            if hasattr(unwrapped, '_fsdp_wrapped_module'):
+                unwrapped = unwrapped._fsdp_wrapped_module
+            encoder = unwrapped.visual
+
+        # Derive d_vis from the actual merger output dim, not from config.
+        d_vis = encoder.merger.mlp[-1].out_features
 
         y_next = torch.zeros(B, max_turns, d_vis, dtype=torch.float32, device=device)
 
@@ -540,18 +549,18 @@ class DataParallelPPOActor(BasePPOActor):
                             continue
 
                         pixel_values = turn_input['pixel_values'].to(
-                            device=device, dtype=self.glance_f_phi.patch_embed.proj.weight.dtype)
+                            device=device, dtype=encoder.patch_embed.proj.weight.dtype)
                         grid_thw = turn_input['image_grid_thw'].to(device=device)
 
                         # visual encoder output: (total_merged_patches, d_vis)
                         # The merger reduces patches by spatial_merge_unit, so
                         # the output length != grid_thw product. Mean-pool all
                         # output patches directly (each obs is typically 1 image).
-                        patch_embeds = self.glance_f_phi(pixel_values, grid_thw=grid_thw)
+                        patch_embeds = encoder(pixel_values, grid_thw=grid_thw)
                         y_next[b, t] = patch_embeds.float().mean(dim=0)
 
-        # Move momentum encoder back to CPU to free GPU memory
-        self.glance_f_phi.to('cpu')
+        if use_momentum:
+            self.glance_f_phi.to('cpu')
 
         valid_count = int(glance_h_mask.sum().item())
         y_norms = y_next[glance_h_mask > 0.5].norm(dim=-1)
