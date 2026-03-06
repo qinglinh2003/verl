@@ -551,6 +551,66 @@ class DataParallelPPOActor(BasePPOActor):
             'glance_y_next': y_next.detach().cpu(),
         })
 
+    def compute_glance_rewards(self, data: DataProto) -> DataProto:
+        """Compute per-turn intrinsic reward from GLANCE prediction error.
+
+        For each valid turn, projects h_{t+1} through g_psi and compares
+        against the momentum target y_{t+1} to produce L_explore and
+        the normalised intrinsic reward r_i = beta * Normalize(L_explore).
+
+        Args:
+            data: DataProto with:
+                - glance_h_pred: (B, max_turns, hidden_size)
+                - glance_h_mask: (B, max_turns)
+                - glance_y_next: (B, max_turns, d_vis)
+
+        Returns:
+            DataProto with:
+                glance_intrinsic_rewards: (B, max_turns) -- r_i per turn
+                glance_l_explore: (B, max_turns) -- raw L_explore per turn
+        """
+        assert self.glance_enabled, "GLANCE is not enabled"
+
+        h_pred = data.batch['glance_h_pred']   # (B, max_turns, hidden_size)
+        h_mask = data.batch['glance_h_mask']    # (B, max_turns)
+        y_next = data.batch['glance_y_next']    # (B, max_turns, d_vis)
+        B, max_turns = h_mask.shape
+
+        device = torch.device(f'cuda:{torch.cuda.current_device()}')
+        self.glance_reward.to(device)
+
+        intrinsic_rewards = torch.zeros(B, max_turns, dtype=torch.float32)
+        l_explore_out = torch.zeros(B, max_turns, dtype=torch.float32)
+
+        with torch.no_grad():
+            for b in range(B):
+                for t in range(max_turns):
+                    if h_mask[b, t] < 0.5:
+                        continue
+                    h = h_pred[b, t].unsqueeze(0).to(device)   # (1, hidden_size)
+                    y = y_next[b, t].unsqueeze(0).to(device)   # (1, d_vis)
+                    l_exp, r_i = self.glance_reward.compute_intrinsic_reward(h, y)
+                    l_explore_out[b, t] = l_exp.item()
+                    intrinsic_rewards[b, t] = r_i.item()
+
+        self.glance_reward.to('cpu')
+
+        valid_count = int(h_mask.sum().item())
+        valid_mask_cpu = h_mask.cpu() > 0.5
+        ri_valid = intrinsic_rewards[valid_mask_cpu]
+        le_valid = l_explore_out[valid_mask_cpu]
+        print(f'[GLANCE] compute_glance_rewards: '
+              f'valid={valid_count} '
+              f'l_explore_mean={le_valid.mean().item():.4f} '
+              f'r_i_mean={ri_valid.mean().item():.4f} '
+              f'r_i_std={ri_valid.std().item():.4f} '
+              f'running_std={self.glance_reward.running_std.std.item():.4f}')
+
+        return DataProto.from_dict(tensors={
+            'glance_intrinsic_rewards': intrinsic_rewards,
+            'glance_l_explore': l_explore_out,
+        })
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()

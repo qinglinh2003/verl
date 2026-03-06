@@ -589,6 +589,15 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_glance_rewards(self, data: DataProto):
+        """Compute per-turn intrinsic reward from GLANCE prediction error."""
+        assert self._is_actor
+        data = data.to(torch.cuda.current_device())
+        output = self.actor.compute_glance_rewards(data=data)
+        output = output.to('cpu')
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 
