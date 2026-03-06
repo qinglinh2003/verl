@@ -521,6 +521,7 @@ class DataParallelPPOActor(BasePPOActor):
         use_momentum = self.glance_config.get('use_momentum', True)
         if use_momentum:
             encoder = self.glance_f_phi
+            encoder_dtype = self.glance_f_phi.patch_embed.proj.weight.dtype
             self.glance_f_phi.to(device)
         else:
             # Ablation: use online visual encoder directly (no EMA lag).
@@ -529,6 +530,9 @@ class DataParallelPPOActor(BasePPOActor):
             if hasattr(unwrapped, '_fsdp_wrapped_module'):
                 unwrapped = unwrapped._fsdp_wrapped_module
             encoder = unwrapped.visual
+            # Cannot access original param dtype through FSDP (use_orig_params=False),
+            # but we know the model runs in bf16 (same as autocast dtype).
+            encoder_dtype = torch.bfloat16
 
         # Derive d_vis from the actual merger output dim, not from config.
         d_vis = encoder.merger.mlp[-1].out_features
@@ -549,7 +553,7 @@ class DataParallelPPOActor(BasePPOActor):
                             continue
 
                         pixel_values = turn_input['pixel_values'].to(
-                            device=device, dtype=encoder.patch_embed.proj.weight.dtype)
+                            device=device, dtype=encoder_dtype)
                         grid_thw = turn_input['image_grid_thw'].to(device=device)
 
                         # visual encoder output: (total_merged_patches, d_vis)
